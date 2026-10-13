@@ -1,0 +1,330 @@
+package com.example.addon.modules;
+
+import com.example.addon.AddonTemplate;
+
+import meteordevelopment.meteorclient.events.game.GameJoinedEvent;
+import meteordevelopment.meteorclient.events.game.GameLeftEvent;
+import meteordevelopment.meteorclient.events.render.Render3DEvent;
+import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.renderer.ShapeMode;
+import meteordevelopment.meteorclient.settings.*;
+import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.utils.render.color.Color;
+import meteordevelopment.meteorclient.utils.render.color.SettingColor;
+import meteordevelopment.orbit.EventHandler;
+
+import net.minecraft.block.Block;
+import net.minecraft.block.Blocks;
+import net.minecraft.client.toast.SystemToast;
+import net.minecraft.text.Text;
+import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.chunk.ChunkSection;
+import net.minecraft.world.chunk.WorldChunk;
+
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class ActivityInspector extends Module {
+
+    private static final int RENDER_DISTANCE = 8;
+    private static final int EARLY_RETURN = 200;
+
+    // ✅ ใช้ Set แทน || chain
+    private static final Set<Block> PLAYER_BLOCKS = Set.of(
+        Blocks.TORCH, Blocks.WALL_TORCH,
+        Blocks.LANTERN, Blocks.SOUL_LANTERN,
+        Blocks.CAMPFIRE, Blocks.SOUL_CAMPFIRE,
+        Blocks.GLOWSTONE, Blocks.SEA_LANTERN,
+        Blocks.SHROOMLIGHT, Blocks.OCHRE_FROGLIGHT,
+        Blocks.VERDANT_FROGLIGHT, Blocks.PEARLESCENT_FROGLIGHT,
+        Blocks.REDSTONE_LAMP, Blocks.FURNACE,
+        Blocks.BLAST_FURNACE, Blocks.SMOKER,
+        Blocks.CRAFTING_TABLE, Blocks.ANVIL,
+        Blocks.ENCHANTING_TABLE, Blocks.BREWING_STAND,
+        Blocks.CAULDRON, Blocks.BEACON,
+        Blocks.RESPAWN_ANCHOR, Blocks.LODESTONE,
+        Blocks.BELL
+    );
+
+    private static final Set<Block> CONTAINER_BLOCKS = Set.of(
+        Blocks.SPAWNER,
+        Blocks.CHEST, Blocks.TRAPPED_CHEST,
+        Blocks.BARREL, Blocks.ENDER_CHEST
+    );
+
+    private final SettingGroup sgGeneral = settings.getDefaultGroup();
+    private final SettingGroup sgAlerts  = settings.createGroup("Alerts");
+    private final SettingGroup sgRender  = settings.createGroup("Render");
+
+    private final Setting<Integer> lightThreshold = sgGeneral.add(new IntSetting.Builder()
+        .name("light-threshold").defaultValue(3).min(1).sliderRange(1, 50).build());
+
+    private final Setting<Integer> blockThreshold = sgGeneral.add(new IntSetting.Builder()
+        .name("block-threshold").defaultValue(15).min(1).sliderRange(1, 100).build());
+
+    private final Setting<Boolean> detectLight = sgGeneral.add(new BoolSetting.Builder()
+        .name("detect-light").defaultValue(true).build());
+
+    private final Setting<Boolean> detectBlocks = sgGeneral.add(new BoolSetting.Builder()
+        .name("detect-blocks").defaultValue(true).build());
+
+    private final Setting<Boolean> alertToast = sgAlerts.add(new BoolSetting.Builder()
+        .name("toast-on-spotted").defaultValue(true).build());
+
+    private final Setting<Boolean> render = sgRender.add(new BoolSetting.Builder()
+        .name("render").defaultValue(true).build());
+
+    private final Setting<SettingColor> boxColor = sgRender.add(new ColorSetting.Builder()
+        .name("box-color")
+        .description("Box color.")
+        .defaultValue(new SettingColor(110, 220, 220, 130))
+        .visible(render::get).build());
+
+    private final Setting<Integer> boxY = sgRender.add(new IntSetting.Builder()
+        .name("box-y").defaultValue(64).range(-64, 320).sliderRange(-64, 320)
+        .visible(render::get).build());
+
+    private volatile ChunkPos flaggedChunk = null;
+    private volatile int flaggedScore = 0;
+    private ChunkPos lastPlayerChunk = null;
+
+    private final Map<Long, LightSnapshot> lightSnapshots = new ConcurrentHashMap<>();
+
+    private final AtomicBoolean scanning = new AtomicBoolean(false);
+
+    private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "activity-inspector");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            return t;
+        }
+    });
+
+    public ActivityInspector() {
+        super(AddonTemplate.CATEGORY, "activity-inspector",
+            "Detects player activity via light-change + block anomaly.");
+    }
+
+    @Override
+    public void onActivate() {
+        flaggedChunk = null;
+        flaggedScore = 0;
+        lastPlayerChunk = null;
+        lightSnapshots.clear();
+    }
+
+    @Override
+    public void onDeactivate() {
+        flaggedChunk = null;
+        flaggedScore = 0;
+        lastPlayerChunk = null;
+        lightSnapshots.clear();
+    }
+
+    @EventHandler
+    private void onGameJoined(GameJoinedEvent e) { onActivate(); }
+    @EventHandler
+    private void onGameLeft(GameLeftEvent e) { onActivate(); }
+
+    @EventHandler
+    private void onTick(TickEvent.Post e) {
+        if (mc.world == null || mc.player == null) return;
+        ChunkPos playerChunk = mc.player.getChunkPos();
+
+        ChunkPos current = flaggedChunk;
+        if (current != null) {
+            int dx = Math.abs(current.x - playerChunk.x);
+            int dz = Math.abs(current.z - playerChunk.z);
+            if (Math.max(dx, dz) > RENDER_DISTANCE + 2) {
+                flaggedChunk = null;
+                flaggedScore = 0;
+            }
+        }
+
+        if (playerChunk.equals(lastPlayerChunk)) return;
+        lastPlayerChunk = playerChunk;
+
+        if (!scanning.compareAndSet(false, true)) return;
+
+        final ChunkPos pc = playerChunk;
+        scanExecutor.submit(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    scanAround(pc);
+                } catch (Throwable ignored) {
+                } finally {
+                    scanning.set(false);
+                }
+            }
+        });
+    }
+
+    private void scanAround(ChunkPos center) {
+        if (mc.world == null) return;
+        ChunkPos bestChunk = null;
+        int bestScore = 0;
+
+        for (int dx = -RENDER_DISTANCE; dx <= RENDER_DISTANCE; dx++) {
+            for (int dz = -RENDER_DISTANCE; dz <= RENDER_DISTANCE; dz++) {
+                int cx = center.x + dx;
+                int cz = center.z + dz;
+                WorldChunk chunk = mc.world.getChunk(cx, cz);
+                if (chunk == null) continue;
+
+                int score = 0;
+                if (detectBlocks.get()) score += scoreChunkByBlocks(chunk);
+                if (detectLight.get()) score += scoreChunkByLight(chunk);
+
+                if (score >= blockThreshold.get() && score > bestScore) {
+                    bestScore = score;
+                    bestChunk = new ChunkPos(cx, cz);
+                }
+            }
+        }
+
+        if (bestChunk == null) return;
+        if (bestScore > flaggedScore) {
+            boolean isNew = !bestChunk.equals(flaggedChunk);
+            flaggedChunk = bestChunk;
+            flaggedScore = bestScore;
+            if (isNew) onChunkSpotted(bestChunk, bestScore);
+        }
+    }
+
+    private int scoreChunkByBlocks(WorldChunk chunk) {
+        ChunkSection[] arr = chunk.getSectionArray();
+        int score = 0;
+        for (int si = 0; si < arr.length; si++) {
+            ChunkSection s = arr[si];
+            if (s == null || s.isEmpty()) continue;
+            if (!s.hasAny(state -> isInterestingBlock(state.getBlock()))) continue;
+
+            for (int x = 0; x < 16; x++)
+                for (int y = 0; y < 16; y++)
+                    for (int z = 0; z < 16; z++) {
+                        Block b = s.getBlockState(x, y, z).getBlock();
+                        if (CONTAINER_BLOCKS.contains(b)) {
+                            if (b == Blocks.SPAWNER) score += 50;
+                            else score += 10;
+                        } else if (PLAYER_BLOCKS.contains(b)) {
+                            score += 1;
+                        }
+                        if (score >= EARLY_RETURN) return score;
+                    }
+        }
+        return score;
+    }
+
+    // ✅ แยก if — ไม่ใช้ || chain
+    private boolean isInterestingBlock(Block b) {
+        if (CONTAINER_BLOCKS.contains(b)) return true;
+        if (PLAYER_BLOCKS.contains(b)) return true;
+        String name = b.toString().toLowerCase();
+        if (name.contains("shulker_box")) return true;
+        return false;
+    }
+
+    private int scoreChunkByLight(WorldChunk chunk) {
+        ChunkPos pos = chunk.getPos();
+        long key = ChunkPos.toLong(pos.x, pos.z);
+        LightSnapshot old = lightSnapshots.get(key);
+        LightSnapshot current = snapshotLight(chunk);
+        if (old == null) { lightSnapshots.put(key, current); return 0; }
+
+        int changed = 0;
+        int max = Math.min(old.blockLight.length, current.blockLight.length);
+        for (int i = 0; i < max; i++) {
+            byte[] oldArr = old.blockLight[i];
+            byte[] newArr = current.blockLight[i];
+            if (oldArr == null || newArr == null) continue;
+            int len = Math.min(oldArr.length, newArr.length);
+            for (int j = 0; j < len; j++) {
+                int ov = oldArr[j] & 0xFF;
+                int nv = newArr[j] & 0xFF;
+                if (nv > ov) changed++;
+            }
+        }
+        lightSnapshots.put(key, current);
+        return changed >= lightThreshold.get() ? changed : 0;
+    }
+
+    private LightSnapshot snapshotLight(WorldChunk chunk) {
+        ChunkSection[] arr = chunk.getSectionArray();
+        byte[][] blockLight = new byte[arr.length][];
+        int baseX = chunk.getPos().getStartX();
+        int baseZ = chunk.getPos().getStartZ();
+        net.minecraft.util.math.BlockPos.Mutable m = new net.minecraft.util.math.BlockPos.Mutable();
+
+        for (int i = 0; i < arr.length; i++) {
+            ChunkSection s = arr[i];
+            if (s == null) continue;
+
+            byte[] sampled = new byte[16 * 16 * 16];
+            int baseY = chunk.sectionIndexToCoord(i) << 4;
+            for (int x = 0; x < 16; x += 2)
+                for (int y = 0; y < 16; y += 2)
+                    for (int z = 0; z < 16; z += 2) {
+                        m.set(baseX + x, baseY + y, baseZ + z);
+                        int level = mc.world.getLightLevel(net.minecraft.world.LightType.BLOCK, m);
+                        int idx = (y * 256) | (z * 16) | x;
+                        sampled[idx] = (byte) level;
+                    }
+            blockLight[i] = sampled;
+        }
+        return new LightSnapshot(blockLight);
+    }
+
+    private void onChunkSpotted(ChunkPos pos, int score) {
+        int centerX = (pos.x << 4) + 8;
+        int centerZ = (pos.z << 4) + 8;
+
+        if (alertToast.get() && mc.getToastManager() != null) {
+            mc.execute(new Runnable() {
+                @Override
+                public void run() {
+                    SystemToast.show(mc.getToastManager(),
+                        SystemToast.Type.NARRATOR_TOGGLE,
+                        Text.literal("Activity Inspector: base detected"),
+                        Text.literal(centerX + ", " + centerZ + " | score " + score));
+                }
+            });
+        }
+    }
+
+    @EventHandler
+    private void onRender3d(Render3DEvent event) {
+        if (!render.get() || mc.world == null || mc.player == null) return;
+
+        ChunkPos pos = flaggedChunk;
+        if (pos == null) return;
+
+        Color c = new Color(boxColor.get());
+
+        double x1 = pos.x * 16.0;
+        double z1 = pos.z * 16.0;
+        double x2 = x1 + 16.0;
+        double z2 = z1 + 16.0;
+        double y = boxY.get();
+
+        event.renderer.box(x1, y, z1, x2, y + 0.04, z2, c, c, ShapeMode.Sides, 0);
+    }
+
+    @Override
+    public String getInfoString() {
+        if (flaggedChunk == null) return "searching";
+        return "score " + flaggedScore;
+    }
+
+    private static class LightSnapshot {
+        final byte[][] blockLight;
+        LightSnapshot(byte[][] blockLight) { this.blockLight = blockLight; }
+    }
+}
